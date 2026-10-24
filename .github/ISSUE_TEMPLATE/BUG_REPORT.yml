@@ -50,9 +50,9 @@ body:
         Select the installation method you used.
         If "other", provide details in the "Additional info" section.
       options:
-        - "Console (UI)"
-        - "Command line"
-        - "GitOps"
+        - "Autobase Platform (UI)"
+        - "Ansible Collection"
+        - "GitOps (CI/CD)"
         - "Other"
     validations:
       required: true
