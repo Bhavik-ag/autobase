@@ -10,6 +10,8 @@ Pre-deployment validations and safety checks for the PostgreSQL cluster stack.
   - HugePages: estimates vm.nr_hugepages for large shared_buffers (>= 8GB) and optionally sets it.
 - Patroni:
   - Validates data directory state depending on cluster stage.
+- Locale provider:
+  - Validates `postgresql_locale_provider`, `postgresql_icu_locale` and `postgresql_builtin_locale` against the PostgreSQL version and encoding before initdb runs.
 - PgBouncer:
   - Computes total pool size and ensures it does not exceed max_connections.
 - Backup tools:
@@ -20,6 +22,8 @@ Pre-deployment validations and safety checks for the PostgreSQL cluster stack.
   - Validates versions/OS for TimescaleDB, pgvectorscale, ParadeDB, etc.
 - Credentials:
   - Generates Patroni passwords when missing or fetches existing ones during maintenance.
+- External secrets:
+  - Validates the provider, secret definitions, AWS region, recovery window, and tags before cluster changes begin.
 
 ## Dependencies
 

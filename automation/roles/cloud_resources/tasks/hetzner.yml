@@ -1,4 +1,15 @@
 ---
+- name: "Hetzner Cloud: Validate spread placement group capacity"
+  ansible.builtin.assert:
+    that:
+      - server_count | int <= 10
+    fail_msg: >-
+      Hetzner spread placement groups support at most 10 servers.
+      Reduce server_count or set hetzner_placement_group=false to deploy without guaranteed host separation.
+  when:
+    - state == 'present'
+    - hetzner_placement_group | bool
+
 # SSH key
 - block:
     # Delete the temporary ssh key from the cloud (if exists)
@@ -20,21 +31,6 @@
         - ssh_key_name | length > 0
         - ssh_key_content | length > 0
 
-    - name: "Hetzner Cloud: Update labels on the existing SSH key"
-      hetzner.hcloud.ssh_key:
-        api_token: "{{ lookup('ansible.builtin.env', 'HCLOUD_API_TOKEN') }}"
-        id: "{{ hetzner_matching_ssh_keys[0].id }}"
-        state: present
-        labels: >-
-          {{
-            hetzner_matching_ssh_keys[0].labels | default({})
-            | combine(cloud_provider_tags)
-            | combine({'cluster': patroni_cluster_name})
-          }}
-      when:
-        - hetzner_matching_ssh_keys | length > 0
-        - hetzner_matching_ssh_keys[0].name == ssh_key_name
-
     # if ssh_key_name and ssh_key_content is specified, add this ssh key to the cloud
     - name: "Hetzner Cloud: Add SSH key '{{ ssh_key_name | default('') }}' to cloud"
       hetzner.hcloud.ssh_key:
@@ -42,7 +38,7 @@
         name: "{{ ssh_key_name }}"
         public_key: "{{ ssh_key_content }}"
         state: present
-        labels: "{{ cloud_provider_tags | combine({'cluster': patroni_cluster_name}) }}"
+        labels: "{{ cloud_provider_tags | combine({'Cluster': patroni_cluster_name}) }}"
       when:
         - ssh_key_name | length > 0
         - ssh_key_content | length > 0
@@ -174,7 +170,7 @@
             name: "{{ hcloud_network_name | default('postgres-cluster-network-' + target_network_zone) }}"
             ip_range: "{{ hcloud_network_ip_range | default('10.0.0.0/16') }}"
             state: present
-            labels: "{{ cloud_provider_tags | combine({'cluster': patroni_cluster_name}) }}"
+            labels: "{{ cloud_provider_tags | combine({'Cluster': patroni_cluster_name}) }}"
 
         - name: "Hetzner Cloud: Create a subnetwork in postgres cluster network"
           hetzner.hcloud.subnetwork:
@@ -198,7 +194,7 @@
         state: "present"
         name: "{{ patroni_cluster_name }}-public-firewall"
         rules: "{{ rules }}"
-        labels: "{{ cloud_provider_tags | combine({'cluster': patroni_cluster_name}) }}"
+        labels: "{{ cloud_provider_tags | combine({'Cluster': patroni_cluster_name}) }}"
       vars:
         rules: >-
           {{
@@ -279,7 +275,7 @@
         state: "present"
         name: "{{ patroni_cluster_name }}-firewall"
         rules: "{{ rules }}"
-        labels: "{{ cloud_provider_tags | combine({'cluster': patroni_cluster_name}) }}"
+        labels: "{{ cloud_provider_tags | combine({'Cluster': patroni_cluster_name}) }}"
       vars:
         rules: >-
           {{
@@ -430,7 +426,27 @@
         index_var: idx
         label: "{{ server_name | lower }}{{ '%02d' % (idx + 1) }}"
       register: server_info
-      failed_when: false
+
+    - name: "Hetzner Cloud: Validate existing servers before assigning a placement group"
+      ansible.builtin.assert:
+        that:
+          - item.placement_group | default('', true) == patroni_cluster_name + '-' + server_location or item.status == 'off'
+        fail_msg: >-
+          Server {{ item.name }} must be powered off before it can join placement group {{ patroni_cluster_name }}-{{ server_location }}.
+          Migrate existing nodes one at a time during maintenance, or set hetzner_placement_group=false to keep their current placement.
+      loop: "{{ server_info.results | map(attribute='hcloud_server_info') | flatten }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: hetzner_placement_group | bool
+
+    - name: "Hetzner Cloud: Create or modify spread placement group"
+      hetzner.hcloud.placement_group:
+        api_token: "{{ lookup('ansible.builtin.env', 'HCLOUD_API_TOKEN') }}"
+        name: "{{ patroni_cluster_name }}-{{ server_location }}"
+        type: spread
+        state: present
+        labels: "{{ cloud_provider_tags | combine({'Cluster': patroni_cluster_name}) }}"
+      when: hetzner_placement_group | bool
 
     - name: "Hetzner Cloud: Create or modify server"
       hetzner.hcloud.server:
@@ -441,12 +457,19 @@
         image: "{{ server_image | lower }}"
         ssh_keys: "{{ ssh_key_names }}"
         location: "{{ server_location }}"
+        placement_group: "{{ (patroni_cluster_name + '-' + server_location) if hetzner_placement_group | bool else omit }}"
+        force: false # Never power off an existing server to change its placement.
         enable_ipv4: "{{ server_public_ip | bool }}"
         enable_ipv6: false
         private_networks:
           - "{{ server_network }}"
         firewalls: "{{ firewalls_list }}"
-        labels: "{{ cloud_provider_tags | combine({'cluster': patroni_cluster_name}) }}"
+        labels: >-
+          {{
+            cloud_provider_tags | combine({'Cluster': patroni_cluster_name})
+            if (server_info.results[idx].hcloud_server_info | default([]) | length == 0)
+            else omit
+          }}
       loop: "{{ range(0, server_count | int) | list }}"
       loop_control:
         index_var: idx
@@ -459,26 +482,6 @@
               (ssh_public_access | bool or netdata_public_access | bool or database_public_access | bool) else []) +
             ([patroni_cluster_name + '-firewall'] if cloud_firewall | bool else [])
           }}
-
-    - name: "Hetzner Cloud: Gather Primary IPs for tagging"
-      hetzner.hcloud.primary_ip_info:
-        api_token: "{{ lookup('ansible.builtin.env', 'HCLOUD_API_TOKEN') }}"
-      register: primary_ip_info
-      when: server_public_ip | bool
-
-    - name: "Hetzner Cloud: Update server Primary IP labels"
-      hetzner.hcloud.primary_ip:
-        api_token: "{{ lookup('ansible.builtin.env', 'HCLOUD_API_TOKEN') }}"
-        id: "{{ item.id }}"
-        auto_delete: "{{ item.auto_delete }}"
-        state: present
-        labels: "{{ cloud_provider_tags | combine({'cluster': patroni_cluster_name}) }}"
-      loop: "{{ primary_ip_info.hcloud_primary_ip_info | default([]) }}"
-      loop_control:
-        label: "{{ item.ip }}"
-      when:
-        - server_public_ip | bool
-        - item.ip in (server_result.results | map(attribute='hcloud_server.ipv4_address') | list)
 
     - name: "Hetzner Cloud: Add server to network '{{ server_network | default('') }}'"
       hetzner.hcloud.server_network:
@@ -499,7 +502,7 @@
         state: present
         size: "{{ volume_size | int }}"
         server: "{{ server_name | lower }}{{ '%02d' % (idx + 1) }}"
-        labels: "{{ cloud_provider_tags | combine({'cluster': patroni_cluster_name}) }}"
+        labels: "{{ cloud_provider_tags | combine({'Cluster': patroni_cluster_name}) }}"
       loop: "{{ range(0, server_count | int) | list }}"
       loop_control:
         index_var: idx
@@ -516,7 +519,7 @@
         algorithm: round_robin
         delete_protection: true
         state: present
-        labels: "{{ cloud_provider_tags | combine({'cluster': patroni_cluster_name}) }}"
+        labels: "{{ cloud_provider_tags | combine({'Cluster': patroni_cluster_name}) }}"
       loop:
         - "primary"
         - "replica"
@@ -629,12 +632,12 @@
         (item == 'sync' and cloud_load_balancer_replica_sync | bool and server_count | int > 1 and synchronous_mode | bool) or
         (item == 'async' and cloud_load_balancer_replica_async | bool and server_count | int > 1 and synchronous_mode | bool))
 
-    - name: "Hetzner Cloud: Add servers to Load Balancer (use label_selector 'cluster={{ patroni_cluster_name | default('postgres-cluster') }}')"
+    - name: "Hetzner Cloud: Add servers to Load Balancer (use label_selector 'Cluster={{ patroni_cluster_name | default('postgres-cluster') }}')"
       hetzner.hcloud.load_balancer_target:
         api_token: "{{ lookup('ansible.builtin.env', 'HCLOUD_API_TOKEN') }}"
         load_balancer: "{{ patroni_cluster_name }}-{{ item }}"
         type: label_selector
-        label_selector: "cluster={{ patroni_cluster_name }}"
+        label_selector: "Cluster={{ patroni_cluster_name }}"
         use_private_ip: true
       loop:
         - "primary"
@@ -748,6 +751,12 @@
       loop_control:
         index_var: idx
         label: "{{ server_name | lower }}{{ '%02d' % (idx + 1) }}"
+
+    - name: "Hetzner Cloud: Delete spread placement group"
+      hetzner.hcloud.placement_group:
+        api_token: "{{ lookup('ansible.builtin.env', 'HCLOUD_API_TOKEN') }}"
+        name: "{{ patroni_cluster_name }}-{{ server_location }}"
+        state: absent
 
     - name: "Hetzner Cloud: Delete volume"
       hetzner.hcloud.volume:

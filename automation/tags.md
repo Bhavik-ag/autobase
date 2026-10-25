@@ -109,6 +109,7 @@
 - - pg_auto_reindexer_cron
 - cron
 - netdata
+- - netdata_pgbouncer
 - ssh_public_keys
 - mount, zpool
 - resizefs
@@ -116,3 +117,4 @@
 - tls
   - tls_cert_generate
   - tls_cert_copy
+- secrets
